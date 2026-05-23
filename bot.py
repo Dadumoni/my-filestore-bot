@@ -49,11 +49,12 @@ logger.info("Logger initialised — level=%s", LOG_LEVEL)
 mongo = AsyncIOMotorClient(os.getenv("MONGO_URI"))
 db = mongo["media_manager_bot"]
 
-channels_col = db["channels"]   # { channel_id, file_count }
-files_col    = db["files"]      # { file_number, files:[{channel_id, message_id}] }
-batches_col  = db["batches"]    # { batch_id, file_groups:[[{channel_id,message_id}],...] }
-counter_col  = db["counter"]    # { _id:"file_counter", value:N }
-admins_col   = db["admins"]     # { user_id, added_by, added_at }
+channels_col  = db["channels"]   # { channel_id, file_count }
+files_col     = db["files"]      # { file_number, files:[{channel_id, message_id}] }
+batches_col   = db["batches"]    # { batch_id, file_groups:[[{channel_id,message_id}],...] }
+counter_col   = db["counter"]    # { _id:"file_counter", value:N }
+admins_col    = db["admins"]     # { user_id, added_by, added_at }
+dupes_col     = db["duplicates"] # { file_unique_id, file_number, saved_at }
 
 logger.info("MongoDB collections bound.")
 
@@ -124,6 +125,34 @@ async def increment_channel_count(channel_id: int):
         upsert=True
     )
 
+
+def get_file_unique_id(message: "Message") -> str | None:
+    """Extract Telegram file_unique_id from any media type."""
+    for attr in ("document", "video", "audio", "photo", "voice", "video_note", "sticker", "animation"):
+        media = getattr(message, attr, None)
+        if media:
+            return getattr(media, "file_unique_id", None)
+    return None
+
+
+async def is_duplicate(file_unique_id: str) -> tuple[bool, int | None]:
+    """
+    Returns (True, file_number) if already saved, else (False, None).
+    file_unique_id is Telegram-assigned — same file always has same ID.
+    """
+    doc = await dupes_col.find_one({"file_unique_id": file_unique_id})
+    if doc:
+        return True, doc["file_number"]
+    return False, None
+
+
+async def register_file_unique_id(file_unique_id: str, file_number: int):
+    await dupes_col.insert_one({
+        "file_unique_id": file_unique_id,
+        "file_number":    file_number,
+        "saved_at":       datetime.now(timezone.utc).isoformat()
+    })
+
 # ─── Core: process one message ───────────────────────────────────────────────
 
 async def process_single_message(message: Message):
@@ -135,6 +164,29 @@ async def process_single_message(message: Message):
     if not channels:
         logger.error("[USER:%d] No available channels — all full.", uid)
         raise RuntimeError("All channels are full (≥1000 files). Add a new channel first.")
+
+    # ── Duplicate check ──────────────────────────────────────────────────────
+    fuid = get_file_unique_id(message)
+    if fuid:
+        dupe, existing_number = await is_duplicate(fuid)
+        if dupe:
+            logger.warning(
+                "[USER:%d] Duplicate detected (file_unique_id=%s) — already saved as file_number=%s. Deleting.",
+                uid, fuid, existing_number
+            )
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await app.send_message(
+                uid,
+                f"⚠️ **Duplicate File Detected!**\n\n"
+                f"Yeh file pehle se save hai (file_number: `{existing_number}`).\n"
+                f"Message delete kar diya gaya. ✅"
+            )
+            return
+    else:
+        logger.debug("[USER:%d] No file_unique_id found — skipping duplicate check.", uid)
 
     file_number = await get_next_file_number()
     logger.info("[USER:%d] Assigned file_number=%d", uid, file_number)
@@ -160,6 +212,22 @@ async def process_single_message(message: Message):
     for ch in channels:
         channel_id = ch["channel_id"]
         logger.info("[USER:%d] Copying file_number=%d → channel=%d", uid, file_number, channel_id)
+
+        # Pyrogram's resolve_peer() fails if the peer is not yet in the local
+        # SQLite cache (common after a fresh deploy or session wipe).
+        # get_chat() forces a server lookup and populates the cache.
+        try:
+            await app.get_chat(channel_id)
+        except Exception as e:
+            logger.error(
+                "[USER:%d] Cannot resolve channel=%d — bot admin hai? Error: %s",
+                uid, channel_id, e
+            )
+            raise RuntimeError(
+                f"Cannot access channel `{channel_id}`.\n"
+                f"Bot ko us channel mein **admin** banana padega.\n`{e}`"
+            )
+
         while True:
             try:
                 copied = await message.copy(chat_id=channel_id, caption=caption)
@@ -191,6 +259,11 @@ async def process_single_message(message: Message):
     })
     logger.info("[USER:%d] file_number=%d saved to DB with %d copies.", uid, file_number, len(saved_files))
 
+    # Register unique ID so future duplicates are caught instantly
+    if fuid:
+        await register_file_unique_id(fuid, file_number)
+        logger.debug("[USER:%d] Registered file_unique_id=%s for file_number=%d", uid, fuid, file_number)
+
     user_batches.setdefault(uid, []).append(saved_files)
 
     try:
@@ -220,6 +293,11 @@ async def create_batch(uid: int):
         parts     = POSTER_URL.rstrip("/").split("/")
         p_chat_id = int("-100" + parts[-2])
         p_msg_id  = int(parts[-1])
+
+        # Resolve both channels before copy_message to avoid "Peer id invalid"
+        await app.get_chat(p_chat_id)
+        await app.get_chat(POST_CHANNEL)
+
         await app.copy_message(
             chat_id=POST_CHANNEL,
             from_chat_id=p_chat_id,
@@ -330,6 +408,43 @@ async def handle_callback(_, query: CallbackQuery):
     label = "♻️ Retrying..." if choice == "retry" else "🚫 Skipped"
     await query.answer(label)
     event.set()
+
+# ─── /start Command ──────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("start") & filters.private)
+async def start(_, message: Message):
+    uid = message.from_user.id
+    admin = await is_admin(uid)
+
+    if admin:
+        text = (
+            "\U0001f44b **Media Manager Bot**\n\n"
+            "\U0001f4c1 Media bhejo aur main automatically save kar dunga!\n\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "\U0001f6e1 **Admin Commands**\n"
+            "/channels \u2014 Target channels list\n"
+            "/add\\_channel `-100xxx` \u2014 Channel add karo\n"
+            "/remove\\_channel `-100xxx` \u2014 Channel remove karo\n\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "\U0001f451 **Owner Only Commands**\n"
+            "/admins \u2014 Admins list dekho\n"
+            "/add\\_admin `user\\_id` \u2014 Admin add karo\n"
+            "/remove\\_admin `user\\_id` \u2014 Admin remove karo\n\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "\U0001f4cc **How it works**\n"
+            "\u2022 Media bhejo \u2192 bot copy karta hai channels mein\n"
+            "\u2022 Har 10 files pe batch automatically ban jaata hai\n"
+            "\u2022 Duplicate files automatically delete ho jaati hain\n"
+            "\u2022 FloodWait pe bot khud wait karta hai\n"
+        )
+    else:
+        text = (
+            "\U0001f44b **Media Manager Bot**\n\n"
+            "Yeh bot sirf authorized admins ke liye hai.\n"
+            "Access ke liye owner se contact karo."
+        )
+    await message.reply_text(text)
+
 
 # ─── Admin Commands (Owner only) ─────────────────────────────────────────────
 
@@ -497,8 +612,69 @@ async def save_media(_, message: Message):
 
 from health_check import start_health_server
 
+
+async def warmup_peer_cache():
+    """
+    Bot start hone ke baad saare registered channels aur POST_CHANNEL ko
+    get_chat() se resolve karta hai — Pyrogram ke SQLite cache mein daal deta hai.
+    Isse pehli file copy pe 'Peer id invalid' error nahi aata.
+    """
+    # Ensure MongoDB indexes for fast duplicate lookup
+    await dupes_col.create_index("file_unique_id", unique=True, background=True)
+    logger.info("MongoDB index ensured on duplicates.file_unique_id")
+
+    logger.info("Warming up peer cache for all channels...")
+    channels = [ch async for ch in channels_col.find({})]
+    failed = []
+    for ch in channels:
+        cid = ch["channel_id"]
+        try:
+            await app.get_chat(cid)
+            logger.info("  ✓ channel=%d resolved", cid)
+        except Exception as e:
+            logger.warning("  ✗ channel=%d FAILED: %s", cid, e)
+            failed.append(cid)
+
+    # POST_CHANNEL
+    try:
+        await app.get_chat(POST_CHANNEL)
+        logger.info("  ✓ POST_CHANNEL=%d resolved", POST_CHANNEL)
+    except Exception as e:
+        logger.warning("  ✗ POST_CHANNEL=%d FAILED: %s", POST_CHANNEL, e)
+
+    # POSTER_URL source channel
+    try:
+        parts     = POSTER_URL.rstrip("/").split("/")
+        p_chat_id = int("-100" + parts[-2])
+        await app.get_chat(p_chat_id)
+        logger.info("  ✓ POSTER source channel=%d resolved", p_chat_id)
+    except Exception as e:
+        logger.warning("  ✗ POSTER source channel FAILED: %s", e)
+
+    if failed:
+        logger.warning(
+            "Peer warm-up: %d channel(s) could not be resolved %s — "
+            "bot ko un channels mein admin banao.",
+            len(failed), failed
+        )
+    else:
+        logger.info("Peer warm-up complete — all channels resolved.")
+
+
+async def on_start(_):
+    logger.info("Bot connected to Telegram.")
+    await warmup_peer_cache()
+
+
 logger.info("Starting health-check server...")
 start_health_server()
 
 logger.info("Starting bot...")
-app.run()
+
+async def main():
+    async with app:
+        await on_start(app)
+        logger.info("Bot is running. Waiting for updates...")
+        await asyncio.get_event_loop().create_future()  # run forever
+
+app.run(main())

@@ -8,7 +8,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
-from pyrogram import filters
+from pyrogram import filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
@@ -133,10 +133,16 @@ async def process_single_message(message: Message):
         await app.get_chat(channel_id)
     except Exception as e:
         logger.error("[USER:%d] Cannot resolve channel=%d: %s", uid, channel_id, e)
-        raise RuntimeError(
-            f"Channel `{channel_id}` resolve nahi hua.\n"
-            f"Bot ko us channel mein **admin** banao.\n`{e}`"
-        )
+        # Try join_chat as fallback (works if channel is public or bot has invite link)
+        try:
+            await app.join_chat(channel_id)
+            logger.info("[USER:%d] Joined channel=%d via join_chat fallback", uid, channel_id)
+        except Exception as e2:
+            logger.error("[USER:%d] join_chat also failed for channel=%d: %s", uid, channel_id, e2)
+            raise RuntimeError(
+                f"Channel `{channel_id}` resolve nahi hua.\n"
+                f"Bot ko us channel mein **Admin** banao, phir ek file forward karo.\n`{e}`"
+            )
 
     while True:
         try:
@@ -299,22 +305,19 @@ async def cmd_start(_, message: Message):
         text = (
             "\U0001f44b **Media Manager Bot**\n\n"
             "\U0001f4c1 Media bhejo — bot automatically save karta hai!\n\n"
-            "\u2501" * 24 + "\n"
-            "\U0001f6e1 **Admin Commands**\n"
-            "/channels \u2014 Channels list + status\n"
-            "/add_channel `-100xxx` \u2014 Channel add karo\n"
-            "/remove_channel `-100xxx` \u2014 Channel remove karo\n\n"
-            "\u2501" * 24 + "\n"
-            "\U0001f451 **Owner Only**\n"
-            "/admins \u2014 Admins list\n"
-            "/add_admin `user_id` \u2014 Admin add karo\n"
-            "/remove_admin `user_id` \u2014 Admin remove karo\n\n"
-            "\u2501" * 24 + "\n"
-            "\U0001f4cc **How it works**\n"
-            "\u2022 Files ek channel mein jaati hain jab tak 1000 na ho jaaye\n"
-            "\u2022 1000 hone ke baad agla channel automatically use hota hai\n"
-            "\u2022 Har 10 files pe batch link ban jaata hai\n"
-            "\u2022 Duplicate files automatically delete hoti hain\n"
+            "**Admin Commands**\n"
+            "/channels — Channels list + status\n"
+            "/add_channel — Channel add karo\n"
+            "/remove_channel — Channel remove karo\n\n"
+            "**Owner Only**\n"
+            "/admins — Admins list\n"
+            "/add_admin — Admin add karo\n"
+            "/remove_admin — Admin remove karo\n\n"
+            "**How it works**\n"
+            "Files ek channel mein jaati hain jab tak 1000 na ho jaaye\n"
+            "1000 ke baad agla channel auto use hota hai\n"
+            "Har 10 files pe batch link banta hai\n"
+            "Duplicate files automatically delete hoti hain"
         )
     else:
         text = (
@@ -322,7 +325,7 @@ async def cmd_start(_, message: Message):
             "Yeh bot sirf authorized admins ke liye hai.\n"
             "Access ke liye owner se contact karo."
         )
-    await message.reply_text(text)
+    await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
 
 # ─── Admin commands (Owner only) ─────────────────────────────────────────────
 
@@ -414,24 +417,57 @@ async def warmup():
 
     logger.info("Warming up peer cache...")
     all_channels = [ch async for ch in channels_col.find({})]
+    failed_channels = []
+
     for ch in all_channels:
         cid = ch["channel_id"]
         try:
             await app.get_chat(cid)
             logger.info("  \u2713 channel=%d resolved", cid)
         except Exception as e:
-            logger.warning("  \u2717 channel=%d FAILED: %s", cid, e)
+            # Peer id invalid = bot ne is channel ko kabhi access nahi kiya.
+            # Fix: bot ko channel mein manually ek message bhejo ya
+            #      /add_channel command se re-add karo AFTER bot ko channel mein add karo.
+            logger.warning(
+                "  \u2717 channel=%d FAILED (%s) — "
+                "Bot ko is channel mein ADMIN banao, phir /add_channel se re-add karo.",
+                cid, e
+            )
+            failed_channels.append(cid)
 
-    for label, cid_expr in [("POST_CHANNEL", lambda: POST_CHANNEL),
-                             ("POSTER source", lambda: int("-100" + POSTER_URL.rstrip("/").split("/")[-2]))]:
+    for label, cid_expr in [
+        ("POST_CHANNEL", lambda: POST_CHANNEL),
+        ("POSTER source", lambda: int("-100" + POSTER_URL.rstrip("/").split("/")[-2]))
+    ]:
         try:
             cid = cid_expr()
             await app.get_chat(cid)
             logger.info("  \u2713 %s=%d resolved", label, cid)
         except Exception as e:
-            logger.warning("  \u2717 %s FAILED: %s", label, e)
+            logger.warning("  \u2717 %s FAILED (%s) — Bot us channel mein admin hai?", label, e)
 
-    logger.info("Warmup complete.")
+    if failed_channels:
+        logger.warning(
+            "Warmup: %d channel(s) unresolved. "
+            "Unhe use karne ki koshish pe runtime mein bhi fail honge. "
+            "Channels: %s", len(failed_channels), failed_channels
+        )
+        # Notify owner
+        try:
+            msg = (
+                "\u26a0\ufe0f **Bot Warmup Warning**\n\n"
+                f"Yeh channels resolve nahi hue:\n"
+                + "\n".join(f"`{c}`" for c in failed_channels) +
+                "\n\nFix:\n"
+                "1. Bot ko channel mein **Admin** banao\n"
+                "2. Bot se us channel mein koi bhi message forward karo\n"
+                "3. `/remove_channel` karke `/add_channel` se dobara add karo"
+            )
+            await app.send_message(OWNER_ID, msg)
+        except Exception:
+            pass
+    else:
+        logger.info("Warmup complete — all channels resolved.")
 
 
 async def main():

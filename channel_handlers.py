@@ -14,7 +14,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from pyrogram import filters
+from pyrogram import filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
@@ -114,18 +114,18 @@ async def cmd_add_channel(_, message: Message):
     except (IndexError, ValueError):
         return await message.reply_text(
             "Usage: `/add_channel -100xxxxxxxxxx`",
-            parse_mode="markdown"
+            parse_mode=enums.ParseMode.MARKDOWN
         )
 
     if await channels_col.find_one({"channel_id": channel_id}):
         return await message.reply_text(
-            f"⚠️ Channel `{channel_id}` is already added.", parse_mode="markdown"
+            f"⚠️ Channel `{channel_id}` is already added.", parse_mode=enums.ParseMode.MARKDOWN
         )
 
     await channels_col.insert_one({"channel_id": channel_id, "file_count": 0})
     logger.info("[USER:%d] Channel added: %d", uid, channel_id)
     await message.reply_text(
-        f"✅ Channel Added:\n`{channel_id}`", parse_mode="markdown"
+        f"✅ Channel Added:\n`{channel_id}`", parse_mode=enums.ParseMode.MARKDOWN
     )
 
 
@@ -146,14 +146,14 @@ async def cmd_remove_channel(_, message: Message):
         channel_id = int(message.command[1])
     except (IndexError, ValueError):
         return await message.reply_text(
-            "Usage: `/remove_channel -100xxxxxxxxxx`", parse_mode="markdown"
+            "Usage: `/remove_channel -100xxxxxxxxxx`", parse_mode=enums.ParseMode.MARKDOWN
         )
 
     result = await channels_col.delete_one({"channel_id": channel_id})
 
     if result.deleted_count == 0:
         return await message.reply_text(
-            f"❌ Channel `{channel_id}` not found in DB.", parse_mode="markdown"
+            f"❌ Channel `{channel_id}` not found in DB.", parse_mode=enums.ParseMode.MARKDOWN
         )
 
     # ── CRITICAL: Clear in-memory cache immediately ───────────────────────────
@@ -174,7 +174,7 @@ async def cmd_remove_channel(_, message: Message):
     await message.reply_text(
         f"✅ Channel Removed:\n`{channel_id}`\n\n"
         f"Bot ab is channel mein koi file nahi bhejega.",
-        parse_mode="markdown"
+        parse_mode=enums.ParseMode.MARKDOWN
     )
 
 
@@ -212,4 +212,4 @@ async def cmd_list_channels(_, message: Message):
 
         lines.append(f"{i}. `{cid}` — {status}{is_act}")
 
-    await message.reply_text("\n".join(lines), parse_mode="markdown")
+    await message.reply_text("\n".join(lines), parse_mode=enums.ParseMode.MARKDOWN)
